@@ -27,6 +27,7 @@ var (
 	unwrapTLS   = flag.Bool("unwrap-tls", false, "remote connection with TLS exposed unencrypted locally")
 	match       = flag.String("match", "", "match regex (in the form 'regex')")
 	replace     = flag.String("replace", "", "replace regex (in the form 'regex~replacer')")
+	whitelist   = flag.String("whitelist", os.Getenv("TCP_PROXY_IP_WHITELIST"), "IP whitelist (comma separated, supports CIDR, IPv4, IPv6)")
 )
 
 func main() {
@@ -57,17 +58,36 @@ func main() {
 
 	matcher := createMatcher(*match)
 	replacer := createReplacer(*replace)
+	ipWhitelist := createIPWhitelist(*whitelist)
 
 	if *veryverbose {
 		*verbose = true
 	}
-
 	for {
 		conn, err := listener.AcceptTCP()
 		if err != nil {
 			logger.Warn("Failed to accept connection '%s'", err)
 			continue
 		}
+
+		// 获取客户端IP地址
+		clientAddr := conn.RemoteAddr().String()
+		clientIP := net.ParseIP(strings.Split(clientAddr, ":")[0])
+		if clientIP == nil {
+			logger.Warn("Failed to parse client IP address: %s", clientAddr)
+			conn.Close()
+			continue
+		}
+
+		// 检查IP白名单
+		if ipWhitelist != nil {
+			if !ipWhitelist(clientIP) {
+				logger.Warn("Connection rejected: IP %s not in whitelist", clientIP.String())
+				conn.Close()
+				continue
+			}
+		}
+
 		connid++
 
 		var p *proxy.Proxy
@@ -136,5 +156,60 @@ func createReplacer(replace string) func([]byte) []byte {
 	logger.Info("Replacing %s with %s", re.String(), repl)
 	return func(input []byte) []byte {
 		return re.ReplaceAll(input, repl)
+	}
+}
+
+func createIPWhitelist(whitelist string) func(net.IP) bool {
+	if whitelist == "" {
+		return nil
+	}
+
+	ips := strings.Split(whitelist, ",")
+	var networks []*net.IPNet
+	var exactIPs []net.IP
+
+	for _, ipStr := range ips {
+		ipStr = strings.TrimSpace(ipStr)
+		if ipStr == "" {
+			continue
+		}
+
+		// 尝试解析为CIDR
+		if strings.Contains(ipStr, "/") {
+			_, ipNet, err := net.ParseCIDR(ipStr)
+			if err != nil {
+				logger.Warn("Invalid CIDR %s: %s", ipStr, err)
+				continue
+			}
+			networks = append(networks, ipNet)
+		} else {
+			// 尝试解析为单个IP
+			ip := net.ParseIP(ipStr)
+			if ip == nil {
+				logger.Warn("Invalid IP address %s", ipStr)
+				continue
+			}
+			exactIPs = append(exactIPs, ip)
+		}
+	}
+
+	logger.Info("IP whitelist configured with %d networks and %d exact IPs", len(networks), len(exactIPs))
+
+	return func(clientIP net.IP) bool {
+		// 检查精确匹配
+		for _, ip := range exactIPs {
+			if ip.Equal(clientIP) {
+				return true
+			}
+		}
+
+		// 检查CIDR匹配
+		for _, network := range networks {
+			if network.Contains(clientIP) {
+				return true
+			}
+		}
+
+		return false
 	}
 }
