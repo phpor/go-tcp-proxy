@@ -7,11 +7,14 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 
+	"github.com/fsnotify/fsnotify"
 	proxy "github.com/jpillora/go-tcp-proxy"
 )
 
@@ -21,27 +24,30 @@ var (
 	connid  = uint64(0)
 	logger  proxy.ColorLogger
 
-	localAddr      = flag.String("l", ":9999", "local address")
-	remoteAddr     = flag.String("r", "localhost:80", "remote address")
-	verbose        = flag.Bool("v", false, "display server actions")
-	veryverbose    = flag.Bool("vv", false, "display server actions and all tcp data")
-	nagles         = flag.Bool("n", false, "disable nagles algorithm")
-	hex            = flag.Bool("h", false, "output hex")
-	colors         = flag.Bool("c", false, "output ansi colors")
-	unwrapTLS      = flag.Bool("unwrap-tls", false, "remote connection with TLS exposed unencrypted locally")
-	match          = flag.String("match", "", "match regex (in the form 'regex')")
-	replace        = flag.String("replace", "", "replace regex (in the form 'regex~replacer')")
-	whitelist      = flag.String("whitelist", os.Getenv("TCP_PROXY_IP_WHITELIST"), "IP whitelist (comma separated, supports CIDR, IPv4, IPv6)")
+	localAddr       = flag.String("l", ":9999", "local address")
+	remoteAddr      = flag.String("r", "localhost:80", "remote address")
+	verbose         = flag.Bool("v", false, "display server actions")
+	veryverbose     = flag.Bool("vv", false, "display server actions and all tcp data")
+	nagles          = flag.Bool("n", false, "disable nagles algorithm")
+	hex             = flag.Bool("h", false, "output hex")
+	colors          = flag.Bool("c", false, "output ansi colors")
+	unwrapTLS       = flag.Bool("unwrap-tls", false, "remote connection with TLS exposed unencrypted locally")
+	match           = flag.String("match", "", "match regex (in the form 'regex')")
+	replace         = flag.String("replace", "", "replace regex (in the form 'regex~replacer')")
+	whitelist       = flag.String("whitelist", os.Getenv("TCP_PROXY_IP_WHITELIST"), "IP whitelist (comma separated, supports CIDR, IPv4, IPv6)")
 	ipWhitelistFile = flag.String("ip-whitelist-file", os.Getenv("TCP_PROXY_IP_WHITELIST_FILE"), "IP whitelist file path (one IP/CIDR per line)")
 )
 
 // IPWhitelistManager 管理IP白名单的加载和检查
 type IPWhitelistManager struct {
-	mu        sync.RWMutex
-	networks  []*net.IPNet
-	exactIPs  []net.IP
-	filePath  string
-	logger    proxy.Logger
+	mu          sync.RWMutex
+	networks    []*net.IPNet
+	exactIPs    []net.IP
+	filePath    string
+	logger      proxy.Logger
+	watcher     *fsnotify.Watcher
+	watcherDone chan struct{}
+	watching    bool
 }
 
 // NewIPWhitelistManager 创建新的IP白名单管理器
@@ -130,6 +136,112 @@ func (wm *IPWhitelistManager) IsAllowed(clientIP net.IP) bool {
 	return false
 }
 
+// StartFileWatcher 启动文件监控，在文件变化时自动重新加载白名单
+// 只在 Linux 系统上启用此功能
+func (wm *IPWhitelistManager) StartFileWatcher() error {
+	if wm.filePath == "" {
+		return fmt.Errorf("no file path configured")
+	}
+
+	// 只在 Linux 上启用文件监控
+	if runtime.GOOS != "linux" {
+		wm.logger.Info("File watching is only supported on Linux, current OS: %s", runtime.GOOS)
+		return nil
+	}
+
+	if wm.watching {
+		return fmt.Errorf("file watcher is already running")
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("failed to create file watcher: %w", err)
+	}
+
+	// 监控文件所在目录
+	dir := filepath.Dir(wm.filePath)
+	if err := watcher.Add(dir); err != nil {
+		watcher.Close()
+		return fmt.Errorf("failed to watch directory %s: %w", dir, err)
+	}
+
+	// 监控文件本身
+	if err := watcher.Add(wm.filePath); err != nil {
+		watcher.Close()
+		return fmt.Errorf("failed to watch file %s: %w", wm.filePath, err)
+	}
+
+	wm.watcher = watcher
+	wm.watcherDone = make(chan struct{})
+	wm.watching = true
+
+	go func() {
+		defer close(wm.watcherDone)
+
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+
+				// 只关心我们监控的文件的变化
+				if event.Op&fsnotify.Write == fsnotify.Write ||
+					event.Op&fsnotify.Create == fsnotify.Create ||
+					event.Op&fsnotify.Rename == fsnotify.Rename ||
+					event.Op&fsnotify.Chmod == fsnotify.Chmod {
+
+					// 检查是否是我们监控的文件
+					if event.Name == wm.filePath {
+						wm.logger.Info("IP whitelist file changed, reloading...")
+						if err := wm.LoadFromFile(); err != nil {
+							wm.logger.Warn("Failed to reload IP whitelist file: %s", err)
+						} else {
+							wm.logger.Info("IP whitelist file reloaded successfully")
+						}
+					}
+				}
+
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				wm.logger.Warn("File watcher error: %s", err)
+
+			case <-wm.watcherDone:
+				return
+			}
+		}
+	}()
+
+	wm.logger.Info("File watcher started for: %s", wm.filePath)
+	return nil
+}
+
+// StopFileWatcher 停止文件监控
+func (wm *IPWhitelistManager) StopFileWatcher() error {
+	if !wm.watching {
+		return nil
+	}
+
+	if wm.watcherDone != nil {
+		close(wm.watcherDone)
+	}
+
+	if wm.watcher != nil {
+		if err := wm.watcher.Close(); err != nil {
+			return fmt.Errorf("failed to close file watcher: %w", err)
+		}
+	}
+
+	wm.watching = false
+	wm.watcher = nil
+	wm.watcherDone = nil
+
+	wm.logger.Info("File watcher stopped")
+	return nil
+}
+
 func main() {
 	flag.Parse()
 
@@ -167,6 +279,10 @@ func main() {
 		// 启动时自动加载白名单文件
 		if err := ipWhitelistManager.LoadFromFile(); err != nil {
 			logger.Warn("Failed to load IP whitelist file: %s", err)
+		}
+		// 启动文件监控
+		if err := ipWhitelistManager.StartFileWatcher(); err != nil {
+			logger.Warn("Failed to start file watcher: %s", err)
 		}
 	}
 
@@ -279,27 +395,36 @@ func createReplacer(replace string) func([]byte) []byte {
 	}
 }
 
-// setupSignalHandler 设置信号处理器，用于重新加载白名单文件
+// setupSignalHandler 设置信号处理器，用于重新加载白名单文件和优雅退出
 func setupSignalHandler(ipWhitelistManager *IPWhitelistManager, logger proxy.Logger) {
 	if ipWhitelistManager == nil {
 		return
 	}
 
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGHUP)
+	signal.Notify(sigChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		for range sigChan {
-			logger.Info("Received SIGHUP signal, reloading IP whitelist file...")
-			if err := ipWhitelistManager.LoadFromFile(); err != nil {
-				logger.Warn("Failed to reload IP whitelist file: %s", err)
-			} else {
-				logger.Info("IP whitelist file reloaded successfully")
+		for sig := range sigChan {
+			switch sig {
+			case syscall.SIGHUP:
+				logger.Info("Received SIGHUP signal, reloading IP whitelist file...")
+				if err := ipWhitelistManager.LoadFromFile(); err != nil {
+					logger.Warn("Failed to reload IP whitelist file: %s", err)
+				} else {
+					logger.Info("IP whitelist file reloaded successfully")
+				}
+			case syscall.SIGINT, syscall.SIGTERM:
+				logger.Info("Received %s signal, stopping file watcher and exiting...", sig)
+				if err := ipWhitelistManager.StopFileWatcher(); err != nil {
+					logger.Warn("Failed to stop file watcher: %s", err)
+				}
+				os.Exit(0)
 			}
 		}
 	}()
 
-	logger.Info("Signal handler setup complete. Send SIGHUP to reload IP whitelist file")
+	logger.Info("Signal handler setup complete. Send SIGHUP to reload IP whitelist file, SIGINT/SIGTERM to exit")
 }
 
 func createIPWhitelist(whitelist string) func(net.IP) bool {
