@@ -33,7 +33,7 @@ func (l NullLogger) Warn(f string, args ...interface{}) {}
 type ColorLogger struct {
 	VeryVerbose bool
 	Verbose     bool
-	Prefix      string
+	Prefix      func() string
 	Color       bool
 }
 
@@ -67,5 +67,9 @@ func (l ColorLogger) output(color, f string, args ...interface{}) {
 	if l.Color && color != "" {
 		f = ansi.Color(f, color)
 	}
-	fmt.Printf(fmt.Sprintf("%s%s\n", l.Prefix, f), args...)
+	prefix := ""
+	if l.Prefix != nil {
+		prefix = l.Prefix()
+	}
+	fmt.Printf(fmt.Sprintf("%s%s\n", prefix, f), args...)
 }

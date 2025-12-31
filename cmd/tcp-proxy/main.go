@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 	proxy "github.com/jpillora/go-tcp-proxy"
@@ -245,9 +246,12 @@ func (wm *IPWhitelistManager) StopFileWatcher() error {
 func main() {
 	flag.Parse()
 
-	logger := proxy.ColorLogger{
+	logger = proxy.ColorLogger{
 		Verbose: *verbose,
 		Color:   *colors,
+		Prefix: func() string {
+			return fmt.Sprintf("[%s] ", time.Now().Format("2006-01-02 15:04:05"))
+		},
 	}
 
 	logger.Info("go-tcp-proxy (%s) proxing from %v to %v ", version, *localAddr, *remoteAddr)
@@ -342,8 +346,10 @@ func main() {
 		p.Log = proxy.ColorLogger{
 			Verbose:     *verbose,
 			VeryVerbose: *veryverbose,
-			Prefix:      fmt.Sprintf("Connection #%03d ", connid),
-			Color:       *colors,
+			Prefix: func() string {
+				return fmt.Sprintf("[%s] Connection #%03d ", time.Now().Format("2006-01-02 15:04:05"), connid)
+			},
+			Color: *colors,
 		}
 
 		go p.Start()
