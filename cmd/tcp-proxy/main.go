@@ -65,7 +65,19 @@ func (wm *IPWhitelistManager) LoadFromFile() error {
 		return nil
 	}
 
-	file, err := os.Open(wm.filePath)
+	// 添加重试机制，处理文件暂时不存在的情况
+	var file *os.File
+	var err error
+	for i := 0; i < 5; i++ {
+		file, err = os.Open(wm.filePath)
+		if err == nil {
+			break
+		}
+		if i < 4 {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
 	if err != nil {
 		return fmt.Errorf("failed to open whitelist file: %w", err)
 	}
@@ -186,19 +198,48 @@ func (wm *IPWhitelistManager) StartFileWatcher() error {
 					return
 				}
 
-				// 只关心我们监控的文件的变化
-				if event.Op&fsnotify.Write == fsnotify.Write ||
-					event.Op&fsnotify.Create == fsnotify.Create ||
-					event.Op&fsnotify.Rename == fsnotify.Rename ||
-					event.Op&fsnotify.Chmod == fsnotify.Chmod {
+				// 检查是否是我们监控的文件或目录中的文件
+				if event.Name == wm.filePath || event.Name == filepath.Dir(wm.filePath) {
 
-					// 检查是否是我们监控的文件
-					if event.Name == wm.filePath {
+					// 处理文件删除和重新创建的情况
+					if event.Op&fsnotify.Remove == fsnotify.Remove && event.Name == wm.filePath {
+						wm.logger.Info("IP whitelist file was removed, waiting for recreation...")
+						// 文件被删除，我们需要等待它被重新创建
+						continue
+					}
+
+					// 处理文件创建或重命名的情况
+					if (event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Rename == fsnotify.Rename) && event.Name == wm.filePath {
+						wm.logger.Info("IP whitelist file was created/renamed, re-adding to watcher...")
+						// 重新添加文件到监控器
+						if err := watcher.Add(wm.filePath); err != nil {
+							wm.logger.Warn("Failed to re-add file to watcher: %s", err)
+						}
+						// 延迟一下再加载，确保文件写入完成
+						time.Sleep(100 * time.Millisecond)
 						wm.logger.Info("IP whitelist file changed, reloading...")
 						if err := wm.LoadFromFile(); err != nil {
 							wm.logger.Warn("Failed to reload IP whitelist file: %s", err)
 						} else {
 							wm.logger.Info("IP whitelist file reloaded successfully")
+						}
+						continue
+					}
+
+					// 处理文件写入和权限变更的情况
+					if event.Op&fsnotify.Write == fsnotify.Write ||
+						event.Op&fsnotify.Chmod == fsnotify.Chmod {
+
+						// 检查是否是我们监控的文件
+						if event.Name == wm.filePath {
+							// 延迟一下再加载，确保文件写入完成
+							time.Sleep(100 * time.Millisecond)
+							wm.logger.Info("IP whitelist file changed, reloading...")
+							if err := wm.LoadFromFile(); err != nil {
+								wm.logger.Warn("Failed to reload IP whitelist file: %s", err)
+							} else {
+								wm.logger.Info("IP whitelist file reloaded successfully")
+							}
 						}
 					}
 				}
